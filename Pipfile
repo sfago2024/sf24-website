@@ -1,0 +1,20 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+requests = "*"
+requests-oauthlib = "*"
+
+[dev-packages]
+python-lsp-server = "*"
+pylsp-mypy = "*"
+pyls-isort = "*"
+python-lsp-black = "*"
+types-requests = "*"
+types-oauthlib = "*"
+types-requests-oauthlib = "*"
+
+[requires]
+python_version = "3.11"
