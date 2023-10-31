@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
@@ -12,10 +14,11 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum, auto
+from operator import attrgetter
 from pathlib import Path
 from textwrap import dedent
 from time import sleep
-from typing import Any, AsyncIterator, Self
+from typing import Any, AsyncIterator, Self, cast
 from zoneinfo import ZoneInfo
 
 import requests
@@ -83,6 +86,7 @@ class Cvent:
     event_id: str
 
     def get(self, url: str, params: dict[str, Any]) -> Response:
+        sleep(1)
         logger.info("GET %s with params %s", url, params)
         response = requests.get(
             f"{API_URL}{url}",
@@ -90,11 +94,24 @@ class Cvent:
             auth=self.auth,
             headers={"Accept": "application/json"},
         )
+        response.raise_for_status()
         (
             Path.home()
             / "cvent-backups"
             / f"{url.replace('/', '')} {datetime.now().isoformat()}.json"
         ).write_text(response.text)
+        return response
+
+    def put(self, url: str, data: dict[str, Any]) -> Response:
+        sleep(1)
+        logger.info("PUT %s with data %s", url, data)
+        response = requests.put(
+            f"{API_URL}{url}",
+            json=data,
+            auth=self.auth,
+            headers={"Accept": "application/json"},
+        )
+        response.raise_for_status()
         return response
 
 
@@ -105,6 +122,26 @@ def slugify(s: str) -> str:
     return SLUG_REPLACE_PATTERN.sub("-", s.casefold()).strip("-")
 
 
+READ_MORE_PATTERN: re.Pattern[str] = re.compile(r"<a .*Read more</a>")
+
+
+def update_session_read_more_link(cvent: Cvent, session: Session) -> None:
+    if session.description is None:
+        logger.warning("Skipping session %s with None description", session.slug)
+        return
+    new_read_more = f'<a href="https://www.sfago2024.org/future/{session.url_relpath}" target="_blank">Read more</a>'
+    if match := READ_MORE_PATTERN.search(session.description):
+        description = READ_MORE_PATTERN.sub(new_read_more, session.description)
+    else:
+        description = session.description + " " + new_read_more
+    if description != session.description:
+        new_data = session.data.copy()
+        new_data["description"] = description
+        if new_data["waitlistCapacity"] == -1:
+            del new_data["waitlistCapacity"]
+        cvent.put(f"/sessions/{session.id}", new_data)
+
+
 @dataclass(frozen=True)
 class Session:
     id: str
@@ -113,6 +150,7 @@ class Session:
     start_time: datetime
     end_time: datetime
     full_description: str | None
+    data: dict[str, Any]
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> Self:
@@ -128,8 +166,9 @@ class Session:
                     for d in data["customFields"]
                     if d["name"] == "SF24 Full Description"
                 ),
-                {"value": None},
-            ).get("value"),
+                cast(dict[str, list[str | None]], {"value": [None]}),
+            )["value"][0],
+            data=data,
         )
 
     @property
@@ -167,7 +206,6 @@ def load_all_sessions(cvent: Cvent) -> dict[str, Session]:
     sessions: dict[str, Session] = {}
     token_param: dict[str, str] = {}
     while True:
-        sleep(1)
         r = cvent.get(
             "/sessions",
             params={
@@ -202,8 +240,7 @@ class Speaker:
 
     @classmethod
     def from_json(cls, data: dict[str, Any], sessions: dict[str, Session]) -> Self:
-        for session in sessions.values():
-            ...
+        # TODO: Figure out speaker types
         return cls(
             id=data["id"],
             first_name=data["firstName"],
@@ -232,7 +269,8 @@ class Speaker:
             return f"composers/{self.slug}/"
         elif SpeakerType.PRESENTER in self.types:
             return f"presenters/{self.slug}/"
-        return None
+        else:
+            return f"people/{self.slug}/"
 
     def link(self, base_url: str) -> str:
         return f'<a href="{base_url}{self.url_relpath}">{self.name}</a>'
@@ -242,7 +280,7 @@ class Speaker:
         if self.photo_url:
             page += dedent(
                 """\
-                <img src="{self.photo_url}">
+                <img class="speaker-photo" src="{self.photo_url}">
                 """
             ).format(**locals())
         if self.bio:
@@ -259,7 +297,6 @@ def load_all_speakers(cvent: Cvent, sessions: dict[str, Session]) -> dict[str, S
     speakers: dict[str, Speaker] = {}
     token_param: dict[str, str] = {}
     while True:
-        sleep(1)
         r = cvent.get(
             "/speakers",
             params={
@@ -334,7 +371,7 @@ async def manage_repo(repo_dir: Path, commit: bool) -> AsyncIterator[None]:
             if proc.returncode != 0:
                 raise RuntimeError(f"'git status' exited {proc.returncode}")
             if stdout:
-                logger.warn("Repo is dirty, cleaning it...")
+                logger.warning("Repo is dirty, cleaning it...")
                 proc = await create_subprocess_exec("git", "stash", "-u", cwd=repo_dir)
                 if (returncode := await proc.wait()) != 0:
                     raise RuntimeError(f"'git stash' exited {returncode}")
@@ -383,13 +420,15 @@ async def generate_pages(
         for session in sessions.values():
             path = outdir / (session.url_relpath.removesuffix("/") + ".md")
             if path.exists():
-                logger.warn("Overwriting duplicate %s", session.url_relpath)
+                logger.warning("Overwriting duplicate %s", session.url_relpath)
             path.write_text(
                 render_page(
                     base_url + session.url_relpath, session.name, session.page_content()
                 )
             )
-        session_links = [s.link(base_url) for s in sessions.values()]
+        session_links = [
+            s.link(base_url) for s in sorted(sessions.values(), key=attrgetter("name"))
+        ]
         (outdir / "sessions/index.md").write_text(
             render_page(
                 base_url + "sessions/",
@@ -398,6 +437,7 @@ async def generate_pages(
             )
         )
 
+        (outdir / "people").mkdir()
         (outdir / "composers").mkdir()
         (outdir / "performers").mkdir()
         (outdir / "presenters").mkdir()
@@ -405,52 +445,27 @@ async def generate_pages(
             if (url_relpath := speaker.url_relpath) is not None:
                 path = outdir / (url_relpath.removesuffix("/") + ".md")
                 if path.exists():
-                    logger.warn("Overwriting duplicate %s", url_relpath)
+                    logger.warning("Overwriting duplicate %s", url_relpath)
                 path.write_text(
                     render_page(
                         base_url + url_relpath, speaker.name, speaker.page_content()
                     )
                 )
-        composer_links = [
-            s.link(base_url)
-            for s in speakers.values()
-            if SpeakerType.COMPOSER in s.types
+        people_links = [
+            s.link(base_url) for s in sorted(speakers.values(), key=attrgetter("name"))
         ]
-        performer_links = [
-            s.link(base_url)
-            for s in speakers.values()
-            if SpeakerType.PERFORMER in s.types
-        ]
-        presenter_links = [
-            s.link(base_url)
-            for s in speakers.values()
-            if SpeakerType.PRESENTER in s.types
-        ]
-        (outdir / "composers/index.md").write_text(
+        (outdir / "people/index.md").write_text(
             render_page(
-                base_url + "composers/",
-                "Composers",
-                index_page("Composers", composer_links),
-            )
-        )
-        (outdir / "performers/index.md").write_text(
-            render_page(
-                base_url + "performers/",
-                "Performers",
-                index_page("Performers", performer_links),
-            )
-        )
-        (outdir / "presenters/index.md").write_text(
-            render_page(
-                base_url + "presenters/",
-                "Presenters",
-                index_page("Presenters", presenter_links),
+                base_url + "people/",
+                "People",
+                index_page("People", people_links),
             )
         )
 
 
 def main() -> None:
     parser = ArgumentParser()
+    parser.add_argument("mode", choices=["gen", "read-more"])
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--repo-dir", type=Path, required=True)
     parser.add_argument("--commit", action="store_true")
@@ -462,11 +477,34 @@ def main() -> None:
     auth = Auth.load_or_fetch_token(repodir, config)
     cvent = Cvent(auth, config.event_id)
 
-    sessions = load_all_sessions(cvent)
-    speakers = load_all_speakers(cvent, sessions)
-    asyncio.run(
-        generate_pages(args.base_url, args.repo_dir, args.commit, sessions, speakers)
-    )
+    if args.mode == "gen":
+        sessions = load_all_sessions(cvent)
+        speakers = load_all_speakers(cvent, sessions)
+        asyncio.run(
+            generate_pages(
+                args.base_url, args.repo_dir, args.commit, sessions, speakers
+            )
+        )
+    elif args.mode == "read-more":
+        sessions = load_all_sessions(cvent)
+        for session in sorted(sessions.values(), key=attrgetter("slug")):
+            if session.full_description:
+                logger.info(
+                    "Session %r has full_description with length %s",
+                    session.name,
+                    len(session.full_description),
+                )
+                try:
+                    update_session_read_more_link(cvent, session)
+                except requests.exceptions.HTTPError as e:
+                    if e.response is not None:
+                        if e.response.status_code == 403:
+                            logger.warning("Ignoring 403 response")
+                        else:
+                            logger.info(e.response.text)
+                            raise
+                    else:
+                        raise
 
 
 if __name__ == "__main__":
