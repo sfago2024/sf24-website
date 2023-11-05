@@ -223,7 +223,7 @@ def load_all_sessions(cvent: Cvent) -> dict[str, Session]:
     return sessions
 
 
-class SpeakerType(Enum):
+class SpeakerCategory(Enum):
     COMPOSER = auto()
     PERFORMER = auto()
     PRESENTER = auto()
@@ -236,18 +236,28 @@ class Speaker:
     last_name: str
     bio: str | None
     photo_url: str | None
-    types: set[SpeakerType]
+    category: SpeakerCategory | None
 
     @classmethod
     def from_json(cls, data: dict[str, Any], sessions: dict[str, Session]) -> Self:
         # TODO: Figure out speaker types
+        category_name = data["category"]["name"]
+        if category_name in {"Composer"}:
+            category = SpeakerCategory.COMPOSER
+        elif category_name in {"Organist", "Performer", "Soprano"}:
+            category = SpeakerCategory.PERFORMER
+        elif category_name in {"Presenter"}:
+            category = SpeakerCategory.PRESENTER
+        else:
+            logger.warning("Unknown category name %r", category_name)
+            category = None
         return cls(
             id=data["id"],
             first_name=data["firstName"],
             last_name=data["lastName"],
             bio=data.get("biography"),
             photo_url=data["links"].get("profilePicture", {"href": None})["href"],
-            types=set(),
+            category=category,
         )
 
     @property
@@ -262,12 +272,12 @@ class Speaker:
         return slugify(self.name)
 
     @property
-    def url_relpath(self) -> str | None:
-        if SpeakerType.PERFORMER in self.types:
-            return f"performers/{self.slug}/"
-        elif SpeakerType.COMPOSER in self.types:
+    def url_relpath(self) -> str:
+        if self.category == SpeakerCategory.COMPOSER:
             return f"composers/{self.slug}/"
-        elif SpeakerType.PRESENTER in self.types:
+        elif self.category == SpeakerCategory.PERFORMER:
+            return f"performers/{self.slug}/"
+        elif self.category == SpeakerCategory.PRESENTER:
             return f"presenters/{self.slug}/"
         else:
             return f"people/{self.slug}/"
@@ -324,14 +334,16 @@ def index_page(title: str, links: list[str]) -> str:
     )
 
 
-def render_page(url: str, title: str, content: str):
+def render_page(url: str, title: str, content: str, aliases: list[str] = []):
     date = datetime.now()
+    alias_list = ",".join(f'"{alias}"' for alias in aliases)
     return dedent(
         """\
         +++
         title = '''{title}'''
         path = '''{url}'''
         template = "future.html"
+        aliases = [{alias_list}]
         +++
 
         <h1>{title}</h1>
@@ -442,15 +454,22 @@ async def generate_pages(
         (outdir / "performers").mkdir()
         (outdir / "presenters").mkdir()
         for speaker in speakers.values():
-            if (url_relpath := speaker.url_relpath) is not None:
-                path = outdir / (url_relpath.removesuffix("/") + ".md")
-                if path.exists():
-                    logger.warning("Overwriting duplicate %s", url_relpath)
-                path.write_text(
-                    render_page(
-                        base_url + url_relpath, speaker.name, speaker.page_content()
-                    )
+            url_relpath = speaker.url_relpath
+            path = outdir / (url_relpath.removesuffix("/") + ".md")
+            if not url_relpath.startswith("people"):
+                aliases = [base_url + "people/" + url_relpath.split("/", maxsplit=1)[1]]
+            else:
+                aliases = []
+            if path.exists():
+                logger.warning("Overwriting duplicate %s", url_relpath)
+            path.write_text(
+                render_page(
+                    base_url + url_relpath,
+                    speaker.name,
+                    speaker.page_content(),
+                    aliases,
                 )
+            )
         people_links = [
             s.link(base_url) for s in sorted(speakers.values(), key=attrgetter("name"))
         ]
