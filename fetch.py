@@ -142,6 +142,12 @@ def update_session_read_more_link(cvent: Cvent, session: Session) -> None:
         cvent.put(f"/sessions/{session.id}", new_data)
 
 
+class SessionCategory(Enum):
+    RECITAL = auto()
+    WORKSHOP = auto()
+    WORSHIP = auto()
+
+
 @dataclass(frozen=True)
 class Session:
     id: str
@@ -151,9 +157,26 @@ class Session:
     end_time: datetime
     full_description: str | None
     data: dict[str, Any]
+    category: SessionCategory | None
+    speakers: list[Speaker]
 
     @classmethod
-    def from_json(cls, data: dict[str, Any]) -> Self:
+    def from_json(
+        cls,
+        data: dict[str, Any],
+        all_speakers: dict[str, Speaker],
+        map: dict[str, list[str]],
+    ) -> Self:
+        category_name: str = data.get("category", {}).get("name", "")
+        try:
+            category = SessionCategory[category_name.upper()]
+        except KeyError:
+            logger.warning(
+                "Unknown session category %r for %s", category_name, data["title"]
+            )
+            category = None
+        speaker_ids = map.get(data["id"], [])
+        speakers = [all_speakers[id] for id in speaker_ids if id in all_speakers]
         return cls(
             id=data["id"],
             name=data["title"],
@@ -168,6 +191,8 @@ class Session:
                 ),
                 cast(dict[str, list[str | None]], {"value": [None]}),
             )["value"][0],
+            category=category,
+            speakers=speakers,
             data=data,
         )
 
@@ -177,12 +202,18 @@ class Session:
 
     @property
     def url_relpath(self) -> str:
+        if self.category == SessionCategory.RECITAL:
+            return f"recitals/{self.slug}/"
+        elif self.category == SessionCategory.WORKSHOP:
+            return f"workshops/{self.slug}/"
+        elif self.category == SessionCategory.WORSHIP:
+            return f"worship/{self.slug}/"
         return f"sessions/{self.slug}/"
 
     def link(self, base_url: str) -> str:
         return f'<a href="{base_url}{self.url_relpath}">{self.name}</a>'
 
-    def page_content(self) -> str:
+    def page_content(self, base_url: str) -> str:
         page = dedent(
             """\
             <h2>Date/Time</h2>
@@ -190,6 +221,18 @@ class Session:
             {self.start_time:%I:%M %p} – {self.end_time:%I:%M %p}</p>
             """
         ).format(**locals())
+        if self.speakers:
+            speaker_items = "\n".join(
+                f"<li>{speaker.link(base_url)}</li>" for speaker in self.speakers
+            )
+            page += dedent(
+                """\
+                <h2>Presenters</h2>
+                <ul>
+                {speaker_items}
+                </ul>
+                """
+            ).format(**locals())
         if desc := self.full_description or self.description:
             page += dedent(
                 """\
@@ -202,7 +245,9 @@ class Session:
         return page
 
 
-def load_all_sessions(cvent: Cvent) -> dict[str, Session]:
+def load_all_sessions(
+    cvent: Cvent, speakers: dict[str, Speaker], map: dict[str, list[str]]
+) -> dict[str, Session]:
     sessions: dict[str, Session] = {}
     token_param: dict[str, str] = {}
     while True:
@@ -215,7 +260,9 @@ def load_all_sessions(cvent: Cvent) -> dict[str, Session]:
             },
         )
         data = r.json()
-        sessions.update({d["id"]: Session.from_json(d) for d in data["data"]})
+        sessions.update(
+            {d["id"]: Session.from_json(d, speakers, map) for d in data["data"]}
+        )
         if (token := data["paging"].get("nextToken")) is not None:
             token_param = {"token": token}
         else:
@@ -239,8 +286,7 @@ class Speaker:
     category: SpeakerCategory | None
 
     @classmethod
-    def from_json(cls, data: dict[str, Any], sessions: dict[str, Session]) -> Self:
-        # TODO: Figure out speaker types
+    def from_json(cls, data: dict[str, Any]) -> Self:
         category_name = data["category"]["name"]
         if category_name in {"Composer"}:
             category = SpeakerCategory.COMPOSER
@@ -249,7 +295,12 @@ class Speaker:
         elif category_name in {"Presenter"}:
             category = SpeakerCategory.PRESENTER
         else:
-            logger.warning("Unknown category name %r", category_name)
+            logger.warning(
+                "Unknown speaker category %r for %s %s",
+                category_name,
+                data["firstName"],
+                data["lastName"],
+            )
             category = None
         return cls(
             id=data["id"],
@@ -303,7 +354,7 @@ class Speaker:
         return page
 
 
-def load_all_speakers(cvent: Cvent, sessions: dict[str, Session]) -> dict[str, Speaker]:
+def load_all_speakers(cvent: Cvent) -> dict[str, Speaker]:
     speakers: dict[str, Speaker] = {}
     token_param: dict[str, str] = {}
     while True:
@@ -316,12 +367,18 @@ def load_all_speakers(cvent: Cvent, sessions: dict[str, Session]) -> dict[str, S
             },
         )
         data = r.json()
-        speakers.update({d["id"]: Speaker.from_json(d, sessions) for d in data["data"]})
+        speakers.update({d["id"]: Speaker.from_json(d) for d in data["data"]})
         if (token := data["paging"].get("nextToken")) is not None:
             token_param = {"token": token}
         else:
             break
     return speakers
+
+
+def load_session_speaker_map(repodir: Path) -> dict[str, list[str]]:
+    with (repodir / "session-speaker-map.json").open() as f:
+        data = json.load(f)
+    return {key.lower(): [v.lower() for v in values] for key, values in data.items()}
 
 
 def index_page(title: str, links: list[str]) -> str:
@@ -332,6 +389,24 @@ def index_page(title: str, links: list[str]) -> str:
             "</ul>",
         ]
     )
+
+
+def workshops_page(sessions: dict[str, Session]) -> str:
+    workshops = []
+    for session in sessions.values():
+        if session.category != SessionCategory.WORKSHOP:
+            continue
+        workshop_lines = [
+            "{{ workshop(",
+            f'  name="{session.name}",',
+        ]
+        for presenter, n in zip(session.speakers, ["", "2", "3"]):
+            workshop_lines.append(f'  presenter{n}="{presenter.name}",')
+        # Need to remove the comma from the last line before the closing paren
+        workshop_lines[-1] = workshop_lines[-1].removesuffix(",")
+        workshop_lines.append(") }}")
+        workshops.append("\n".join(workshop_lines))
+    return "\n\n".join(workshops)
 
 
 def render_page(url: str, title: str, content: str, aliases: list[str] = []):
@@ -429,13 +504,26 @@ async def generate_pages(
         outdir.mkdir()
 
         (outdir / "sessions").mkdir()
+        (outdir / "recitals").mkdir()
+        (outdir / "workshops").mkdir()
+        (outdir / "worship").mkdir()
         for session in sessions.values():
-            path = outdir / (session.url_relpath.removesuffix("/") + ".md")
+            url_relpath = session.url_relpath
+            path = outdir / (url_relpath.removesuffix("/") + ".md")
+            if not url_relpath.startswith("sessions"):
+                aliases = [
+                    base_url + "sessions/" + url_relpath.split("/", maxsplit=1)[1]
+                ]
+            else:
+                aliases = []
             if path.exists():
-                logger.warning("Overwriting duplicate %s", session.url_relpath)
+                logger.warning("Overwriting duplicate %s", url_relpath)
             path.write_text(
                 render_page(
-                    base_url + session.url_relpath, session.name, session.page_content()
+                    base_url + url_relpath,
+                    session.name,
+                    session.page_content(base_url),
+                    aliases,
                 )
             )
         session_links = [
@@ -448,6 +536,14 @@ async def generate_pages(
                 index_page("Sessions", session_links),
             )
         )
+
+        # (outdir / "workshops/index.md").write_text(
+        #     render_page(
+        #         base_url + "workshops/",
+        #         "Workshops",
+        #         workshops_page(sessions),
+        #     )
+        # )
 
         (outdir / "people").mkdir()
         (outdir / "composers").mkdir()
@@ -497,33 +593,14 @@ def main() -> None:
     cvent = Cvent(auth, config.event_id)
 
     if args.mode == "gen":
-        sessions = load_all_sessions(cvent)
-        speakers = load_all_speakers(cvent, sessions)
+        map = load_session_speaker_map(repodir)
+        speakers = load_all_speakers(cvent)
+        sessions = load_all_sessions(cvent, speakers, map)
         asyncio.run(
             generate_pages(
                 args.base_url, args.repo_dir, args.commit, sessions, speakers
             )
         )
-    elif args.mode == "read-more":
-        sessions = load_all_sessions(cvent)
-        for session in sorted(sessions.values(), key=attrgetter("slug")):
-            if session.full_description:
-                logger.info(
-                    "Session %r has full_description with length %s",
-                    session.name,
-                    len(session.full_description),
-                )
-                try:
-                    update_session_read_more_link(cvent, session)
-                except requests.exceptions.HTTPError as e:
-                    if e.response is not None:
-                        if e.response.status_code == 403:
-                            logger.warning("Ignoring 403 response")
-                        else:
-                            logger.info(e.response.text)
-                            raise
-                    else:
-                        raise
 
 
 if __name__ == "__main__":
