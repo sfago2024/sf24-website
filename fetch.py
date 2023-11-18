@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum, auto
+from itertools import chain
 from operator import attrgetter
 from pathlib import Path
 from textwrap import dedent
@@ -290,7 +291,14 @@ class Speaker:
         category_name = data["category"]["name"]
         if category_name in {"Composer"}:
             category = SpeakerCategory.COMPOSER
-        elif category_name in {"Organist", "Performer", "Soprano"}:
+        elif category_name in {
+            "Organist",
+            "Performer",
+            "Soprano",
+            "Violinist",
+            "Trombonist",
+            "Conductor",
+        }:
             category = SpeakerCategory.PERFORMER
         elif category_name in {"Presenter"}:
             category = SpeakerCategory.PRESENTER
@@ -411,7 +419,11 @@ def workshops_page(sessions: dict[str, Session]) -> str:
 
 def render_page(url: str, title: str, content: str, aliases: list[str] = []):
     date = datetime.now()
-    alias_list = ",".join(f'"{alias}"' for alias in aliases)
+    aliases_with_future = [f"/future{url}"]
+    aliases_with_future.extend(
+        chain.from_iterable([alias, f"/future{alias}"] for alias in aliases)
+    )
+    alias_list = ",".join(f'"{alias}"' for alias in aliases_with_future)
     return dedent(
         """\
         +++
@@ -429,7 +441,7 @@ def render_page(url: str, title: str, content: str, aliases: list[str] = []):
 
 
 @asynccontextmanager
-async def manage_repo(repo_dir: Path, commit: bool) -> AsyncIterator[None]:
+async def manage_repo(repo_dir: Path, commit: bool, push: bool) -> AsyncIterator[None]:
     proc = await create_subprocess_exec(
         "git", "status", "--porcelain", cwd=repo_dir, stdout=PIPE
     )
@@ -479,34 +491,41 @@ async def manage_repo(repo_dir: Path, commit: bool) -> AsyncIterator[None]:
             proc = await create_subprocess_exec(
                 "git",
                 "commit",
-                "--author=cvent-webhook-handler <colin+cventwebhookhandler@lumeh.org>",
-                "--message=cvent-webhook-handler update",
+                "--author=sf24-website <colin+sf24website@lumeh.org>",
+                "--message=sf24-website update",
                 cwd=repo_dir,
             )
             if (returncode := await proc.wait()) != 0:
                 raise RuntimeError(f"'git commit' exited {returncode}")
-            proc = await create_subprocess_exec("git", "push", cwd=repo_dir)
-            if (returncode := await proc.wait()) != 0:
-                raise RuntimeError(f"'git push' exited {returncode}")
+            if push:
+                proc = await create_subprocess_exec("git", "push", cwd=repo_dir)
+                if (returncode := await proc.wait()) != 0:
+                    raise RuntimeError(f"'git push' exited {returncode}")
+
+
+def prepare_dir(path: Path) -> None:
+    path.mkdir()
+    (path / "_index.md").write_text("+++\nrender = false\n+++\n")
 
 
 async def generate_pages(
     base_url: str,
     repo_dir: Path,
     commit: bool,
+    push: bool,
     sessions: dict[str, Session],
     speakers: dict[str, Speaker],
 ) -> None:
-    async with manage_repo(repo_dir, commit):
+    async with manage_repo(repo_dir, commit, push):
         outdir = repo_dir / "content/_generated"
         if outdir.is_dir():
             shutil.rmtree(outdir)
         outdir.mkdir()
 
-        (outdir / "sessions").mkdir()
-        (outdir / "recitals").mkdir()
-        (outdir / "workshops").mkdir()
-        (outdir / "worship").mkdir()
+        prepare_dir(outdir / "sessions")
+        prepare_dir(outdir / "recitals")
+        prepare_dir(outdir / "workshops")
+        prepare_dir(outdir / "worship")
         for session in sessions.values():
             url_relpath = session.url_relpath
             path = outdir / (url_relpath.removesuffix("/") + ".md")
@@ -545,10 +564,10 @@ async def generate_pages(
         #     )
         # )
 
-        (outdir / "people").mkdir()
-        (outdir / "composers").mkdir()
-        (outdir / "performers").mkdir()
-        (outdir / "presenters").mkdir()
+        prepare_dir(outdir / "people")
+        prepare_dir(outdir / "composers")
+        prepare_dir(outdir / "performers")
+        prepare_dir(outdir / "presenters")
         for speaker in speakers.values():
             url_relpath = speaker.url_relpath
             path = outdir / (url_relpath.removesuffix("/") + ".md")
@@ -584,7 +603,11 @@ def main() -> None:
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--repo-dir", type=Path, required=True)
     parser.add_argument("--commit", action="store_true")
+    parser.add_argument("--push", action="store_true")
     args = parser.parse_args()
+
+    if args.push and not args.commit:
+        raise ValueError(f"--push requires --commit")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     repodir = Path(__file__).parent
@@ -598,7 +621,7 @@ def main() -> None:
         sessions = load_all_sessions(cvent, speakers, map)
         asyncio.run(
             generate_pages(
-                args.base_url, args.repo_dir, args.commit, sessions, speakers
+                args.base_url, args.repo_dir, args.commit, args.push, sessions, speakers
             )
         )
 
