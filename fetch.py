@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import re
@@ -19,7 +20,7 @@ from operator import attrgetter
 from pathlib import Path
 from textwrap import dedent
 from time import sleep
-from typing import Any, AsyncIterator, Self, cast
+from typing import Any, AsyncIterator, Callable, Self, TypeVar, cast
 from zoneinfo import ZoneInfo
 
 import requests
@@ -27,6 +28,7 @@ from oauthlib.oauth2 import BackendApplicationClient
 from requests import PreparedRequest, Response
 from requests.auth import AuthBase, HTTPBasicAuth
 from requests_oauthlib import OAuth2Session
+from unidecode import unidecode
 
 ACCESS_TOKEN_BUFFER = timedelta(seconds=30)
 API_URL = "https://api-platform.cvent.com/ea"
@@ -81,11 +83,30 @@ class Auth(AuthBase):
         return cls(token["access_token"])
 
 
+T = TypeVar("T", bound=Callable)
+
+
+def log_response_errors(func: T) -> T:
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except HTTPError as e:
+            logger.debug(
+                "Caught HTTPError. Response content: %s",
+                e.response.content.decode("utf-8", errors="replace"),
+            )
+            raise
+
+    return cast(T, wrapper)
+
+
 @dataclass(frozen=True)
 class Cvent:
     auth: Auth
     event_id: str
 
+    @log_response_errors
     def get(self, url: str, params: dict[str, Any]) -> Response:
         sleep(1)
         logger.info("GET %s with params %s", url, params)
@@ -103,6 +124,7 @@ class Cvent:
         ).write_text(response.text)
         return response
 
+    @log_response_errors
     def put(self, url: str, data: dict[str, Any]) -> Response:
         sleep(1)
         logger.info("PUT %s with data %s", url, data)
@@ -417,13 +439,49 @@ def workshops_page(sessions: dict[str, Session]) -> str:
     return "\n\n".join(workshops)
 
 
+RENAME_ALIASES = {
+    "berkeley-symphony": "berkeley-symphony-orchestra",
+    "shin-young-lee-olivier-latry-with-the-berkeley-symphony": "shin-young-lee-olivier-latry-with-the-berkeley-symphony-orchestra",
+}
+
+USED_RENAMES = set()
+
+
+def _find_old_url(url: str) -> str | None:
+    for new_part, old_part in RENAME_ALIASES.items():
+        if new_part in url.split("/"):
+            USED_RENAMES.add(new_part)
+            return url.replace(new_part, old_part)
+    return None
+
+
 def render_page(url: str, title: str, content: str, aliases: list[str] = []):
     date = datetime.now()
-    aliases_with_future = [f"/future{url}"]
-    aliases_with_future.extend(
-        chain.from_iterable([alias, f"/future{alias}"] for alias in aliases)
-    )
-    alias_list = ",".join(f'"{alias}"' for alias in aliases_with_future)
+    aliases_with_future = [f"/future{url}", *(f"/future{alias}" for alias in aliases)]
+
+    aliases_with_renames: list[str] = []
+    if old_url := _find_old_url(url):
+        aliases_with_renames.append(old_url)
+    # For regular aliases, we need both the new- and old-named versions.
+    for alias in aliases:
+        aliases_with_renames.append(alias)
+        if old_alias := _find_old_url(alias):
+            aliases_with_renames.append(old_alias)
+    # For future aliases, since the future site used only the old name, we only need
+    # the old-named version.
+    for future_alias in aliases_with_future:
+        if old_future_alias := _find_old_url(future_alias):
+            aliases_with_renames.append(old_future_alias)
+        else:
+            aliases_with_renames.append(future_alias)
+
+    # Additionally, if any aliases contain non-ascii-characters, add an alias with the
+    # closest possible ASCII-only representation.
+    for alias in aliases_with_renames[:]:
+        if (unidecoded := unidecode(alias)) != alias:
+            aliases_with_renames.append(unidecoded)
+
+    alias_list = ",".join(f'"{alias}"' for alias in aliases_with_renames)
     return dedent(
         """\
         +++
@@ -595,6 +653,9 @@ async def generate_pages(
                 index_page("People", people_links),
             )
         )
+
+        if unused_renames := (set(RENAME_ALIASES.keys()) - USED_RENAMES):
+            raise RuntimeError(f"Some renames were unused: {sorted(unused_renames)}")
 
 
 def main() -> None:
