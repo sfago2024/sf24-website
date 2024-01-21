@@ -27,6 +27,7 @@ import requests
 from oauthlib.oauth2 import BackendApplicationClient
 from requests import PreparedRequest, Response
 from requests.auth import AuthBase, HTTPBasicAuth
+from requests.exceptions import HTTPError
 from requests_oauthlib import OAuth2Session
 from unidecode import unidecode
 
