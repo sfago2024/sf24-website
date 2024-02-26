@@ -210,7 +210,7 @@ class Session:
             full_description=next(
                 (
                     d
-                    for d in data["customFields"]
+                    for d in data.get("customFields", [])
                     if d["name"] == "SF24 Full Description"
                 ),
                 cast(dict[str, list[str | None]], {"value": [None]}),
@@ -442,7 +442,11 @@ def workshops_page(sessions: dict[str, Session]) -> str:
 
 RENAME_ALIASES = {
     "berkeley-symphony": "berkeley-symphony-orchestra",
+    "new-organ-chorales-in-the-schübler-tradition": "new-organ-chorales-in-the-schubler-tradition",
     "shin-young-lee-olivier-latry-with-the-berkeley-symphony": "shin-young-lee-olivier-latry-with-the-berkeley-symphony-orchestra",
+    "the-castro-tales-of-the-village-walking-tour-sold-out": "the-castro-tales-of-the-village-walking-tour",
+    "visit-to-sfmoma-sold-out": "visit-to-sfmoma",
+    "walking-tour-of-chinatown-sold-out": "walking-tour-of-chinatown",
 }
 
 USED_RENAMES = set()
