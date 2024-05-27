@@ -446,7 +446,7 @@ RENAME_ALIASES = {
     "shin-young-lee-olivier-latry-with-the-berkeley-symphony": "shin-young-lee-olivier-latry-with-the-berkeley-symphony-orchestra",
     "the-castro-tales-of-the-village-walking-tour-sold-out": "the-castro-tales-of-the-village-walking-tour",
     "visit-to-sfmoma-sold-out": "visit-to-sfmoma",
-    "walking-tour-of-chinatown-sold-out": "walking-tour-of-chinatown",
+    "walking-tour-of-chinatown": "walking-tour-of-chinatown-sold-out",
 }
 
 USED_RENAMES = set()
