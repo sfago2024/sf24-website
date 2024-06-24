@@ -12,9 +12,10 @@ from argparse import ArgumentParser
 from asyncio import create_subprocess_exec
 from asyncio.subprocess import PIPE
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum, auto
+from fnmatch import fnmatch
 from itertools import chain
 from operator import attrgetter
 from pathlib import Path
@@ -146,26 +147,6 @@ def slugify(s: str) -> str:
     return SLUG_REPLACE_PATTERN.sub("-", s.casefold()).strip("-")
 
 
-READ_MORE_PATTERN: re.Pattern[str] = re.compile(r"<a .*Read more</a>")
-
-
-def update_session_read_more_link(cvent: Cvent, session: Session) -> None:
-    if session.description is None:
-        logger.warning("Skipping session %s with None description", session.slug)
-        return
-    new_read_more = f'<a href="https://www.sfago2024.org/future/{session.url_relpath}" target="_blank">Read more</a>'
-    if match := READ_MORE_PATTERN.search(session.description):
-        description = READ_MORE_PATTERN.sub(new_read_more, session.description)
-    else:
-        description = session.description + " " + new_read_more
-    if description != session.description:
-        new_data = session.data.copy()
-        new_data["description"] = description
-        if new_data["waitlistCapacity"] == -1:
-            del new_data["waitlistCapacity"]
-        cvent.put(f"/sessions/{session.id}", new_data)
-
-
 class SessionCategory(Enum):
     RECITAL = auto()
     WORKSHOP = auto()
@@ -220,22 +201,20 @@ class Session:
             data=data,
         )
 
-    @property
     def slug(self) -> str:
         return slugify(self.name)
 
-    @property
-    def url_relpath(self) -> str:
+    def url_relpath(self, slug: str) -> str:
         if self.category == SessionCategory.RECITAL:
-            return f"recitals/{self.slug}/"
+            return f"recitals/{slug}/"
         elif self.category == SessionCategory.WORKSHOP:
-            return f"workshops/{self.slug}/"
+            return f"workshops/{slug}/"
         elif self.category == SessionCategory.WORSHIP:
-            return f"worship/{self.slug}/"
-        return f"sessions/{self.slug}/"
+            return f"worship/{slug}/"
+        return f"sessions/{slug}/"
 
-    def link(self, base_url: str) -> str:
-        return f'<a href="{base_url}{self.url_relpath}">{self.name}</a>'
+    def link(self, base_url: str, url_relpath: str) -> str:
+        return f'<a href="{base_url}{url_relpath}">{self.name}</a>'
 
     def page_content(self, base_url: str) -> str:
         page = dedent(
@@ -247,7 +226,8 @@ class Session:
         ).format(**locals())
         if self.speakers:
             speaker_items = "\n".join(
-                f"<li>{speaker.link(base_url)}</li>" for speaker in self.speakers
+                f"<li>{get_speaker_or_session_link(base_url, speaker)}</li>"
+                for speaker in self.speakers
             )
             page += dedent(
                 """\
@@ -349,23 +329,21 @@ class Speaker:
         else:
             return self.last_name
 
-    @property
     def slug(self) -> str:
         return slugify(self.name)
 
-    @property
-    def url_relpath(self) -> str:
+    def url_relpath(self, slug: str) -> str:
         if self.category == SpeakerCategory.COMPOSER:
-            return f"composers/{self.slug}/"
+            return f"composers/{slug}/"
         elif self.category == SpeakerCategory.PERFORMER:
-            return f"performers/{self.slug}/"
+            return f"performers/{slug}/"
         elif self.category == SpeakerCategory.PRESENTER:
-            return f"presenters/{self.slug}/"
+            return f"presenters/{slug}/"
         else:
-            return f"people/{self.slug}/"
+            return f"people/{slug}/"
 
-    def link(self, base_url: str) -> str:
-        return f'<a href="{base_url}{self.url_relpath}">{self.name}</a>'
+    def link(self, base_url: str, url_relpath: str) -> str:
+        return f'<a href="{base_url}{url_relpath}">{self.name}</a>'
 
     def page_content(self) -> str:
         page = ""
@@ -440,24 +418,172 @@ def workshops_page(sessions: dict[str, Session]) -> str:
     return "\n\n".join(workshops)
 
 
-RENAME_ALIASES = {
-    "berkeley-symphony": "berkeley-symphony-orchestra",
-    "new-organ-chorales-in-the-schübler-tradition": "new-organ-chorales-in-the-schubler-tradition",
-    "shin-young-lee-olivier-latry-with-the-berkeley-symphony": "shin-young-lee-olivier-latry-with-the-berkeley-symphony-orchestra",
-    "the-castro-tales-of-the-village-walking-tour-sold-out": "the-castro-tales-of-the-village-walking-tour",
-    "visit-to-sfmoma-sold-out": "visit-to-sfmoma",
-    "walking-tour-of-chinatown": "walking-tour-of-chinatown-sold-out",
+@dataclass(frozen=True)
+class NameInfo:
+    name: str | None
+    aliases: list[str] = field(default_factory=list)
+
+
+# pattern (matching name in Cvent) -> NameInfo
+RENAME_INFO = {
+    "berkeley-symphony": NameInfo(
+        None,
+        aliases=["berkeley-symphony-orchestra"],
+    ),
+    "new-organ-chorales-in-the-schübler-tradition": NameInfo(
+        None,
+        ["new-organ-chorales-in-the-schubler-tradition"],
+    ),
+    "visit-to-museum-of-the-african-diaspora*": NameInfo(
+        "visit-to-museum-of-the-african-diaspora",
+        ["visit-to-sfmoma-sold-out", "visit-to-sfmoma"],
+    ),
+    "shin-young-lee-olivier-latry-with-the-berkeley-symphony*": NameInfo(
+        "shin-young-lee-olivier-latry-with-the-berkeley-symphony",
+        ["shin-young-lee-olivier-latry-with-the-berkeley-symphony-orchestra"],
+    ),
+    "opening-worship-in-the-reform-jewish-tradition*": NameInfo(
+        "opening-worship-in-the-reform-jewish-tradition",
+    ),
+    "walking-tour-of-chinatown*": NameInfo(
+        "walking-tour-of-chinatown",
+        ["walking-tour-of-chinatown-sold-out"],
+    ),
+    "group-a-dong-ill-shin-2-00-pm*": NameInfo(
+        "group-a-dong-ill-shin-2-00-pm",
+    ),
+    "group-b-chanticleer-2-00-pm*": NameInfo(
+        "group-b-chanticleer-2-00-pm",
+    ),
+    "group-b-nicole-keller-2-00-pm*": NameInfo(
+        "group-b-nicole-keller-2-00-pm",
+    ),
+    "group-a-nicole-keller-3-30-pm*": NameInfo(
+        "group-a-nicole-keller-3-30-pm",
+    ),
+    "group-a-roman-catholic-worship-service-3-30-pm*": NameInfo(
+        "group-a-roman-catholic-worship-service-3-30-pm",
+    ),
+    "group-a-chanticleer-3-30-pm*": NameInfo(
+        "group-a-chanticleer-3-30-pm",
+    ),
+    "group-b-dong-ill-shin-3-30-pm*": NameInfo(
+        "group-b-dong-ill-shin-3-30-pm",
+    ),
+    "faythe-freese-buses*": NameInfo(
+        "faythe-freese",
+    ),
+    "the-castro-tales-of-the-village-walking-tour*": NameInfo(
+        "the-castro-tales-of-the-village-walking-tour",
+        ["the-castro-tales-of-the-village-walking-tour-sold-out"],
+    ),
+    "mission-dolores-tour-and-choral-workshop*": NameInfo(
+        "mission-dolores-tour-and-choral-workshop",
+    ),
+    "group-d-peter-sykes-1-30-pm*": NameInfo(
+        "group-d-peter-sykes-1-30-pm",
+    ),
+    "group-c-ken-cowan-1-30-pm*": NameInfo(
+        "group-c-ken-cowan-1-30-pm",
+    ),
+    "group-e-rashaan-rori-allwood-1-30-pm*": NameInfo(
+        "group-e-rashaan-rori-allwood-1-30-pm",
+    ),
+    "group-f-aaron-tan-1-30-pm*": NameInfo(
+        "group-f-aaron-tan-1-30-pm",
+    ),
+    "group-c-peter-sykes-2-45-pm*": NameInfo(
+        "group-c-peter-sykes-2-45-pm",
+    ),
+    "group-d-ken-cowan-2-45-pm*": NameInfo(
+        "group-d-ken-cowan-2-45-pm",
+    ),
+    "group-e-aaron-tan-2-45-pm*": NameInfo(
+        "group-e-aaron-tan-2-45-pm",
+    ),
+    "abigail-crafton-alexander-leonardi-owen-tellinghuisen-rising-stars*": NameInfo(
+        "abigail-crafton-alexander-leonardi-owen-tellinghuisen-rising-stars",
+    ),
+    "joey-fala-9-00-am*": NameInfo(
+        "joey-fala-9-00-am",
+    ),
+    "douglas-cleveland-9-00-am*": NameInfo(
+        "douglas-cleveland-9-00-am",
+    ),
+    "diane-meredith-belcher-9-00-am*": NameInfo(
+        "diane-meredith-belcher-9-00-am",
+    ),
+    "james-kealey-robert-horton-2022-nyacop-ncoi-winners*": NameInfo(
+        "james-kealey-robert-horton-2022-nyacop-ncoi-winners",
+        ["james-kealey-robert-horton-2022-ncoi-nyacop-winners"],
+    ),
+    "douglas-cleveland-10-45-am*": NameInfo(
+        "douglas-cleveland-10-45-am",
+    ),
+    "nathan-elsbernd-trevor-good-marshall-joos-rising-stars*": NameInfo(
+        "nathan-elsbernd-trevor-good-marshall-joos-rising-stars",
+    ),
+    "joey-fala-10-45-am*": NameInfo(
+        "joey-fala-10-45-am",
+    ),
+    "diane-meredith-belcher-10-45-am*": NameInfo(
+        "diane-meredith-belcher-10-45-am",
+    ),
+    "st-cecilia-recital-and-reception-janette-fishell*": NameInfo(
+        "st-cecilia-recital-and-reception-janette-fishell",
+        ["st-cecilia-recital-janette-fishell"],
+    ),
+    "african-american-baptist-worship-service-stephen-price-patrick-alston*": NameInfo(
+        "african-american-baptist-worship-service-stephen-price-patrick-alston",
+    ),
+    "weicheng-zhao*": NameInfo(
+        "weicheng-zhao",
+    ),
+    "episcopal-morning-prayer-mary-beth-bennett*": NameInfo(
+        "episcopal-morning-prayer-mary-beth-bennett",
+    ),
+    "jonathan-moyer*": NameInfo(
+        "jonathan-moyer",
+    ),
+    "monica-berney*": NameInfo(
+        "monica-berney",
+    ),
+    "anne-laver*": NameInfo(
+        "anne-laver",
+    ),
+    "annette-richards*": NameInfo(
+        "annette-richards",
+    ),
+    "the-tudor-organ-at-stanford*": NameInfo(
+        "the-tudor-organ-at-stanford",
+    ),
+    "coffee-and-conversation-tuesday*": NameInfo(
+        None,
+        ["coffee-and-conversation"],
+    ),
 }
 
 USED_RENAMES = set()
 
 
-def _find_old_url(url: str) -> str | None:
-    for new_part, old_part in RENAME_ALIASES.items():
-        if new_part in url.split("/"):
-            USED_RENAMES.add(new_part)
-            return url.replace(new_part, old_part)
-    return None
+def _find_old_urls(url: str) -> list[str]:
+    components = url.removesuffix("/").split("/")
+    _, aliases = find_name_info(components[-1])
+    return ["/".join(components[:-1] + [alias]) + "/" for alias in aliases]
+
+
+def find_name_info(slug: str) -> tuple[str, list[str]]:
+    for pattern, info in RENAME_INFO.items():
+        if fnmatch(slug, pattern):
+            USED_RENAMES.add(pattern)
+            return info.name or slug, info.aliases
+    return slug, []
+
+
+def get_speaker_or_session_link(base_url: str, s: Speaker | Session) -> str:
+    slug, aliases = find_name_info(s.slug())
+    url_relpath = s.url_relpath(slug)
+    return s.link(base_url, url_relpath)
 
 
 def render_page(url: str, title: str, content: str, aliases: list[str] = []):
@@ -465,20 +591,14 @@ def render_page(url: str, title: str, content: str, aliases: list[str] = []):
     aliases_with_future = [f"/future{url}", *(f"/future{alias}" for alias in aliases)]
 
     aliases_with_renames: list[str] = []
-    if old_url := _find_old_url(url):
-        aliases_with_renames.append(old_url)
-    # For regular aliases, we need both the new- and old-named versions.
+    aliases_with_renames.extend(_find_old_urls(url))
     for alias in aliases:
         aliases_with_renames.append(alias)
-        if old_alias := _find_old_url(alias):
-            aliases_with_renames.append(old_alias)
-    # For future aliases, since the future site used only the old name, we only need
-    # the old-named version.
+        aliases_with_renames.extend(_find_old_urls(alias))
+    # NOTE: Technically we don't need future aliases with both old and new names, but figuring it out correctly is too hard.
     for future_alias in aliases_with_future:
-        if old_future_alias := _find_old_url(future_alias):
-            aliases_with_renames.append(old_future_alias)
-        else:
-            aliases_with_renames.append(future_alias)
+        aliases_with_renames.append(future_alias)
+        aliases_with_renames.extend(_find_old_urls(future_alias))
 
     # Additionally, if any aliases contain non-ascii-characters, add an alias with the
     # closest possible ASCII-only representation.
@@ -590,7 +710,8 @@ async def generate_pages(
         prepare_dir(outdir / "workshops")
         prepare_dir(outdir / "worship")
         for session in sessions.values():
-            url_relpath = session.url_relpath
+            slug, aliases = find_name_info(session.slug())
+            url_relpath = session.url_relpath(slug)
             path = outdir / (url_relpath.removesuffix("/") + ".md")
             if not url_relpath.startswith("sessions"):
                 aliases = [
@@ -608,9 +729,9 @@ async def generate_pages(
                     aliases,
                 )
             )
-        session_links = [
-            s.link(base_url) for s in sorted(sessions.values(), key=attrgetter("name"))
-        ]
+        session_links = []
+        for session in sorted(sessions.values(), key=attrgetter("name")):
+            session_links.append(get_speaker_or_session_link(base_url, session))
         (outdir / "sessions/index.md").write_text(
             render_page(
                 base_url + "sessions/",
@@ -632,7 +753,8 @@ async def generate_pages(
         prepare_dir(outdir / "performers")
         prepare_dir(outdir / "presenters")
         for speaker in speakers.values():
-            url_relpath = speaker.url_relpath
+            slug, aliases = find_name_info(speaker.slug())
+            url_relpath = speaker.url_relpath(slug)
             path = outdir / (url_relpath.removesuffix("/") + ".md")
             if not url_relpath.startswith("people"):
                 aliases = [base_url + "people/" + url_relpath.split("/", maxsplit=1)[1]]
@@ -648,9 +770,9 @@ async def generate_pages(
                     aliases,
                 )
             )
-        people_links = [
-            s.link(base_url) for s in sorted(speakers.values(), key=attrgetter("name"))
-        ]
+        people_links = []
+        for speaker in sorted(speakers.values(), key=attrgetter("name")):
+            people_links.append(get_speaker_or_session_link(base_url, speaker))
         (outdir / "people/index.md").write_text(
             render_page(
                 base_url + "people/",
@@ -659,8 +781,9 @@ async def generate_pages(
             )
         )
 
-        if unused_renames := (set(RENAME_ALIASES.keys()) - USED_RENAMES):
-            raise RuntimeError(f"Some renames were unused: {sorted(unused_renames)}")
+        if unused_renames := (set(RENAME_INFO.keys()) - USED_RENAMES):
+            unused_list = ", ".join(sorted(unused_renames))
+            raise RuntimeError(f"Some renames were unused: {unused_list}")
 
 
 def main() -> None:

@@ -16,6 +16,7 @@ python-lsp-black = "*"
 types-requests = "*"
 types-oauthlib = "*"
 types-requests-oauthlib = "*"
+black = "*"
 
 [requires]
 python_version = "3.11"
