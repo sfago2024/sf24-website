@@ -547,6 +547,7 @@ RENAME_INFO = {
     ),
     "monica-berney*": NameInfo(
         "monica-berney",
+        ["monica-czausz-berney"],
     ),
     "anne-laver*": NameInfo(
         "anne-laver",
@@ -560,6 +561,10 @@ RENAME_INFO = {
     "coffee-and-conversation-tuesday*": NameInfo(
         None,
         ["coffee-and-conversation"],
+    ),
+    "closing-gala-reception*": NameInfo(
+        "closing-gala-reception",
+        ["closing-reception"],
     ),
 }
 
